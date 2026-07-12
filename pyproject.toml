@@ -1,0 +1,19 @@
+[project]
+name = "comfy-int4-hiptest"
+description = "AMD/HIP native Triton W4A4 ConvRot nodes for ComfyUI."
+version = "1.0.6"
+license = {file = "LICENSE"} 
+classifiers = [
+    "Operating System :: OS Independent",
+    "Environment :: GPU :: AMD ROCm",
+]
+
+[project.urls]
+Repository = "https://github.com/document97/Comfy-INT4-HIPtest"
+"Bug Tracker" = "https://github.com/document97/Comfy-INT4-HIPtest/issues"
+
+[tool.comfy]
+PublisherId = "document97"
+DisplayName = "Comfy-INT4-HIPtest"
+Icon = ""
+includes = []
