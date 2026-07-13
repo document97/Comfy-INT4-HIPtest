@@ -31,6 +31,26 @@ for tname in ("float8_e4m3fn", "float8_e5m2"):
     if hasattr(torch, tname):
         fp8_types.append(getattr(torch, tname))
 
+def _copy_tensor_to_device(tensor, device):
+    """Materialize an owned tensor on device without an async source lifetime."""
+    if tensor is None or tensor.device == device:
+        return tensor
+    result = torch.empty(tensor.shape, dtype=tensor.dtype, device=device)
+    result.copy_(tensor.detach(), non_blocking=False)
+    return result
+
+
+def _copy_tensor_to_host(tensor):
+    """Materialize an owned tensor in pageable CPU memory."""
+    source = tensor.detach()
+    if source.device.type == "cuda":
+        torch.cuda.synchronize(source.device)
+        host = torch.empty(source.shape, dtype=source.dtype, device="cpu")
+        host.copy_(source, non_blocking=False)
+        torch.cuda.synchronize(source.device)
+        return host
+    return source.to(device="cpu", copy=True)
+
 class Int4Ops(manual_cast):
     excluded_names = []
     dynamic_quantize = False
@@ -505,32 +525,22 @@ class Int4Ops(manual_cast):
                 from .native_int4 import is_gfx1103_target, triton_convrot_w4a4_linear
 
                 if is_gfx1103_target():
-                    need_cast = self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0
-                    if need_cast:
-                        weight, bias, offload_stream = cast_bias_weight(
-                            self,
-                            input=None,
-                            dtype=torch.int8,
-                            device=x.device,
-                            bias_dtype=x.dtype,
-                            offloadable=True,
-                        )
-                    else:
-                        weight = self.weight
-                        bias = self.bias
-                        offload_stream = None
-
-                    if weight is not None and weight.device != x.device:
-                        weight = weight.to(x.device, non_blocking=True)
-                    if bias is not None and bias.device != x.device:
-                        bias = bias.to(x.device, non_blocking=True)
-
-                    if not isinstance(weight, QuantizedTensor):
+                    source_weight = self.weight
+                    if not isinstance(source_weight, QuantizedTensor):
                         raise RuntimeError("gfx1103 native INT4 path expected a QuantizedTensor weight")
 
-                    params = weight.params
+                    # Never send a packed ConvRot QuantizedTensor through
+                    # cast_bias_weight(): requesting dtype=int8 changes the
+                    # logical output dtype and forces an unsupported dequantize.
+                    # Move the two physical tensors independently instead.
+                    params = source_weight.params
                     if getattr(params, "transposed", False):
                         raise RuntimeError("gfx1103 native INT4 path does not accept a transposed packed weight")
+                    qdata = _copy_tensor_to_device(source_weight._qdata, x.device)
+                    weight_scale = _copy_tensor_to_device(params.scale, x.device)
+                    bias = _copy_tensor_to_device(self.bias, x.device)
+                    for function in self.bias_function:
+                        bias = function(bias)
 
                     compute_dtype = getattr(Int4Ops, "compute_dtype", None)
                     if compute_dtype is None:
@@ -541,20 +551,16 @@ class Int4Ops(manual_cast):
                             f"got {compute_dtype}"
                         )
 
-                    try:
-                        y = triton_convrot_w4a4_linear(
-                            x,
-                            weight._qdata,
-                            params.scale,
-                            bias,
-                            convrot_groupsize=params.convrot_groupsize,
-                            quant_group_size=params.quant_group_size,
-                            linear_dtype=params.linear_dtype,
-                            output_dtype=compute_dtype,
-                        )
-                    finally:
-                        if need_cast:
-                            uncast_bias_weight(self, weight, bias, offload_stream)
+                    y = triton_convrot_w4a4_linear(
+                        x,
+                        qdata,
+                        weight_scale,
+                        bias,
+                        convrot_groupsize=params.convrot_groupsize,
+                        quant_group_size=params.quant_group_size,
+                        linear_dtype=params.linear_dtype,
+                        output_dtype=compute_dtype,
+                    )
                 else:
                     y = super().forward(x)
 
@@ -564,8 +570,8 @@ class Int4Ops(manual_cast):
                     x_2d = x.reshape(-1, x_shape[-1])
                     y_2d = y.reshape(-1, y_shape[-1])
                     for lora_down, lora_up, lora_start, lora_size in self.lora_patches:
-                        lD = lora_down.to(x.device, non_blocking=True)
-                        lU = lora_up.to(x.device, non_blocking=True)
+                        lD = _copy_tensor_to_device(lora_down, x.device)
+                        lU = _copy_tensor_to_device(lora_up, x.device)
                         lora_x = F.linear(x_2d.to(lD.dtype), lD)
                         lora_y = F.linear(lora_x, lU).to(y_2d.dtype)
                         if lora_start is not None:
@@ -704,7 +710,12 @@ class INT4ModelPatcher(comfy.model_patcher.ModelPatcher):
         patches = self.patches.get(key, [])
 
         if is_int4_module and Int4Ops.Linear._is_bias_key(key):
-            return comfy.utils.get_attr(self.model, key) if return_weight else None
+            # Only the weight is packed. LightX2V acceleration LoRAs also
+            # contain diff_b patches, so regular floating-point biases must be
+            # handled by ComfyUI's standard patcher.
+            return super().patch_weight_to_device(
+                key, device_to, inplace_update, return_weight, force_cast
+            )
 
         if is_int4_module:
             if not Int4Ops.dynamic_lora:
@@ -789,7 +800,6 @@ class INT4ModelPatcher(comfy.model_patcher.ModelPatcher):
                     return
             else:
                 weight = comfy.utils.get_attr(self.model, key)
-                device = weight.device if weight is not None else self.offload_device
                 lora_patches = []
                 for p in patches:
                     strength_patch = p[0]
@@ -828,7 +838,13 @@ class INT4ModelPatcher(comfy.model_patcher.ModelPatcher):
                         if offset is not None:
                             _dim, start, size = offset
 
-                        lora_patches.append((down_scaled.to(device), up.flatten(1).to(device), start, size))
+                        # Dynamic adapter tensors are not registered Parameters,
+                        # so Module.to()/partial unload cannot manage their
+                        # lifetime. Keep owned pageable CPU storage until load()
+                        # packs the complete patch set into stable GPU arenas.
+                        down_owned = down_scaled.detach().to(device="cpu").contiguous().clone()
+                        up_owned = up.flatten(1).detach().to(device="cpu").contiguous().clone()
+                        lora_patches.append((down_owned, up_owned, start, size))
 
                 module.lora_patches = lora_patches
                 if return_weight:
@@ -837,9 +853,78 @@ class INT4ModelPatcher(comfy.model_patcher.ModelPatcher):
         
         return super().patch_weight_to_device(key, device_to, inplace_update, return_weight, force_cast)
 
+    def _materialize_dynamic_lora_arena(self, device):
+        if not Int4Ops.dynamic_lora or device is None:
+            return
+        device = torch.device(device)
+        if device.type != "cuda":
+            return
+
+        module_patches = {}
+        records_by_dtype = {}
+        all_ready = True
+        tensor_count = 0
+        for module in self.model.modules():
+            patches = getattr(module, "lora_patches", None)
+            if not patches:
+                continue
+            editable = [list(patch) for patch in patches]
+            module_patches[module] = editable
+            for patch_index, patch in enumerate(patches):
+                for tensor_index in (0, 1):
+                    tensor = patch[tensor_index]
+                    tensor_count += 1
+                    all_ready = all_ready and tensor.device == device
+                    records_by_dtype.setdefault(tensor.dtype, []).append(
+                        (module, patch_index, tensor_index, tensor)
+                    )
+
+        if tensor_count == 0 or all_ready:
+            return
+
+        arenas = []
+        total_bytes = 0
+        for dtype, records in records_by_dtype.items():
+            total_numel = sum(tensor.numel() for _, _, _, tensor in records)
+            host_arena = torch.empty(total_numel, dtype=dtype, device="cpu")
+            offset = 0
+            layouts = []
+            for module, patch_index, tensor_index, tensor in records:
+                count = tensor.numel()
+                host_source = _copy_tensor_to_host(tensor) if tensor.device.type == "cuda" else tensor.detach()
+                host_arena[offset:offset + count].copy_(host_source.reshape(-1), non_blocking=False)
+                layouts.append((module, patch_index, tensor_index, offset, count, tuple(tensor.shape)))
+                offset += count
+
+            device_arena = _copy_tensor_to_device(host_arena, device)
+            arenas.append(device_arena)
+            total_bytes += device_arena.nbytes
+            for module, patch_index, tensor_index, offset, count, shape in layouts:
+                module_patches[module][patch_index][tensor_index] = device_arena[offset:offset + count].view(shape)
+
+        for module, patches in module_patches.items():
+            module.lora_patches = [tuple(patch) for patch in patches]
+        self._int4_lora_device_arenas = arenas
+        logging.info(
+            "INT4 Fast: materialized %d Dynamic LoRA tensors in %d stable GPU arena(s), %.2f MiB total.",
+            tensor_count,
+            len(arenas),
+            total_bytes / (1024 * 1024),
+        )
+
     def load(self, *args, **kwargs):
         self.finalize_pending_int8()
         save_materialized = bool(getattr(self, "_int4_save_materialized_lora", False))
+        dynamic_lora_uuid = getattr(self, "patches_uuid", None)
+        dynamic_lora_changed = (
+            Int4Ops.dynamic_lora
+            and getattr(self, "_int4_dynamic_lora_patches_uuid", None) != dynamic_lora_uuid
+        )
+        if dynamic_lora_changed:
+            for module in self.model.modules():
+                if hasattr(module, "lora_patches"):
+                    module.lora_patches = []
+            self._int4_lora_device_arenas = []
 
         if not Int4Ops.dynamic_lora and not save_materialized:
             for k in list(self.backup):
@@ -887,7 +972,8 @@ class INT4ModelPatcher(comfy.model_patcher.ModelPatcher):
                             module.weight_lowvram_function = None
                         if hasattr(module, "weight_function"):
                             module.weight_function = [f for f in getattr(module, "weight_function", []) if type(f).__name__ != "LowVramPatch"]
-                        self.patch_weight_to_device(weight_key, device_to=device_to)
+                        if not module.lora_patches:
+                            self.patch_weight_to_device(weight_key, device_to=device_to)
                     else:
                         if hasattr(module, "weight_function"):
                             module.weight_function = [f for f in getattr(module, "weight_function", []) if type(f).__name__ != "LowVramPatch"]
@@ -903,6 +989,10 @@ class INT4ModelPatcher(comfy.model_patcher.ModelPatcher):
                             lowvram_patch._pin_state = pin_state
                         module.weight_lowvram_function = lowvram_patch
 
+        self._materialize_dynamic_lora_arena(device_to)
+        if Int4Ops.dynamic_lora:
+            self._int4_dynamic_lora_patches_uuid = dynamic_lora_uuid
+
         return res
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
@@ -910,6 +1000,8 @@ class INT4ModelPatcher(comfy.model_patcher.ModelPatcher):
             for name, module in self.model.named_modules():
                 if hasattr(module, "lora_patches"):
                     module.lora_patches = []
+            self._int4_lora_device_arenas = []
+            self._int4_dynamic_lora_patches_uuid = None
         return super().unpatch_model(device_to, unpatch_weights)
 
     def clone(self, *args, **kwargs):
