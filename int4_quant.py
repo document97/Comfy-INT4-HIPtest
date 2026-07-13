@@ -416,7 +416,13 @@ class Int4Ops(manual_cast):
 
         def forward(self, x: Tensor) -> Tensor:
             if not self._is_quantized:
-                return super().forward(x)
+                # Sensitive/excluded layers are intentionally retained in
+                # BF16 by mixed-precision INT4 checkpoints.  Always use
+                # ComfyUI's manual-cast path here so their weight/device dtype
+                # follows the current activation and dynamic LoRA patches are
+                # applied.  Quantized layers continue through the native
+                # INT4/INT8 branches below.
+                return self.forward_comfy_cast_weights(x)
 
             if getattr(self, "_quant_format", "convrot_w4a4") == "int8_tensorwise":
                 from . import int8_quant
