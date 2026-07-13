@@ -55,12 +55,56 @@ Restart ComfyUI after installing or updating the node.
 The plugin is not a general CUDA INT4 implementation. Other GPUs may require
 different Triton kernels and backend constraints.
 
-## Verified model
+## Verified models
 
-The primary validation model is
-[Krea2 Turbo INT4](https://huggingface.co/comfyanonymous/int4_tests/blob/main/split_files/diffusion_models/krea2_turbo_convrot_int4_fast.safetensors).
+The native gfx1103 W4A4 path has been tested with:
+
+- [Krea2 Turbo INT4](https://huggingface.co/comfyanonymous/int4_tests/blob/main/split_files/diffusion_models/krea2_turbo_convrot_int4_fast.safetensors)
+  for image generation. A 1024 x 1024, 8-step workflow was used for the main
+  validation run.
+- WAN2.1 14B SCAIL-2 ConvRot INT4 for video generation, including the
+  LightX2V I2V 14B 480p CFG/step-distillation acceleration LoRA in `Dynamic`
+  mode.
+
 Place model files in ComfyUI's normal diffusion-model directory and load them
-with the W4A4 node.
+with the W4A4 node. Models with compatible W4A4 ConvRot metadata should use the
+same path, but models not listed above have not necessarily been tested by this
+repository owner.
+
+## LoRA modes
+
+The W4A4 loader exposes three `lora_mode` choices. `None` means normal-rounding
+LoRA baking; it does **not** disable LoRA loading.
+
+- `None`: bake LoRA patches into the model using normal INT4 rounding. This is
+  the default and has the lowest runtime overhead, but very small LoRA updates
+  can be rounded away.
+- `Stochastic`: bake LoRA patches using stochastic rounding. This can retain
+  small updates better than normal rounding, while still using baked weights.
+- `Dynamic`: keep LoRA matrices separate and apply their deltas at inference
+  time. Use this for acceleration LoRAs such as LightX2V and when preserving
+  small LoRA updates is more important than the additional runtime cost.
+
+Multiple standard, model-compatible LoRAs may be chained with ComfyUI's
+`LoraLoaderModelOnly` nodes in any node order. In `Dynamic` mode the complete
+active patch set is packed into stable GPU arenas, and the arenas are rebuilt
+when ComfyUI changes the patch set. Ordinary LoRAs and acceleration LoRAs can
+therefore be combined, provided every LoRA targets the loaded model architecture
+and has compatible keys and tensor shapes.
+
+This statement covers standard LoRA patches loaded by `LoraLoaderModelOnly`.
+LoHa, LoKr, LyCORIS, DoRA and other adapter formats have not been validated and
+should not be assumed to work through the same Dynamic path.
+
+When updating from an older checkout, restart ComfyUI before testing. Older
+versions could leave Dynamic LoRA tensors on an unsafe transfer path or call
+`dequantize()` on packed ConvRot INT4 weights during a partial model reload. A
+current run should report messages similar to:
+
+```text
+INT4 Fast: materialized ... Dynamic LoRA tensors in ... stable GPU arena(s)
+INT4 Fast: using native gfx1103 Triton ConvRot W4A4 (... no eager fallback).
+```
 
 The first run may compile Triton kernels. Subsequent runs reuse the Triton
 cache. If ComfyUI reports the CUDA backend instead of
