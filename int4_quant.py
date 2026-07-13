@@ -560,19 +560,22 @@ class Int4Ops(manual_cast):
 
                 if self.lora_patches:
                     x_shape = x.shape
+                    y_shape = y.shape
                     x_2d = x.reshape(-1, x_shape[-1])
+                    y_2d = y.reshape(-1, y_shape[-1])
                     for lora_down, lora_up, lora_start, lora_size in self.lora_patches:
                         lD = lora_down.to(x.device, non_blocking=True)
                         lU = lora_up.to(x.device, non_blocking=True)
                         lora_x = F.linear(x_2d.to(lD.dtype), lD)
-                        lora_y = F.linear(lora_x, lU)
+                        lora_y = F.linear(lora_x, lU).to(y_2d.dtype)
                         if lora_start is not None:
-                            y[:, lora_start:lora_start + lora_size] = (
-                                y[:, lora_start:lora_start + lora_size] + lora_y.to(y.dtype)
+                            y_2d[:, lora_start:lora_start + lora_size] = (
+                                y_2d[:, lora_start:lora_start + lora_size] + lora_y
                             )
                         else:
-                            y = y + lora_y.to(y.dtype)
-                
+                            y_2d = y_2d + lora_y
+                    y = y_2d.reshape(y_shape)
+
                 return y
 
     class GroupNorm(manual_cast.GroupNorm): pass
@@ -808,13 +811,18 @@ class INT4ModelPatcher(comfy.model_patcher.ModelPatcher):
                         if mid is not None:
                             down_scaled = torch.mm(mid.flatten(1), down.flatten(1)) * scale
 
-                        if getattr(module, "_convrot_groupsize", None) is not None and down_scaled.shape[1] % module._convrot_groupsize == 0:
-                            try:
-                                from .convrot import build_hadamard, rotate_weight
-                                H = build_hadamard(module._convrot_groupsize, device=down_scaled.device, dtype=down_scaled.dtype)
-                                down_scaled = rotate_weight(down_scaled, H, group_size=module._convrot_groupsize)
-                            except ImportError:
-                                pass
+                        if (
+                            getattr(module, "_quant_format", "convrot_w4a4") == "int8_tensorwise"
+                            and getattr(module, "_use_convrot", False)
+                        ):
+                            group_size = getattr(module, "_convrot_groupsize", 256)
+                            if down_scaled.shape[1] % group_size == 0:
+                                try:
+                                    from .convrot import build_hadamard, rotate_weight
+                                    H = build_hadamard(group_size, device=down_scaled.device, dtype=down_scaled.dtype)
+                                    down_scaled = rotate_weight(down_scaled, H, group_size=group_size)
+                                except ImportError:
+                                    pass
 
                         start, size = None, None
                         if offset is not None:
